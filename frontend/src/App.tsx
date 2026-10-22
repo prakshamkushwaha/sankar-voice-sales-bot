@@ -1,3 +1,163 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Activity, Bot, CheckCircle2, Clock3, Headphones,
+  History, LoaderCircle, Mic, Phone, PhoneOff,
+  Play, Volume2, X
+} from "lucide-react";
+import type { CallRecord, TranscriptMessage } from "./types";
+import "./App.css";
+
+const API = (import.meta.env.VITE_API_URL || "http://localhost:5000").replace(/\/$/, "");
+type RecognitionAlternative = { transcript: string };
+type RecognitionResult = ArrayLike<RecognitionAlternative> & { isFinal: boolean };
+type RecognitionEvent = {
+  resultIndex: number;
+  results: ArrayLike<RecognitionResult>;
+};
+type Recognition = {
+  lang: string; continuous: boolean; interimResults: boolean;
+  onresult: ((event: RecognitionEvent) => void) | null;
+  onerror: ((event: { error: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void; stop: () => void; abort: () => void;
+};
+type RecognitionConstructor = new () => Recognition;
+declare global {
+  interface Window {
+    SpeechRecognition?: RecognitionConstructor;
+    webkitSpeechRecognition?: RecognitionConstructor;
+  }
+}
+function formatTime(seconds: number) {
+  return `${Math.floor(seconds / 60).toString().padStart(2, "0")}:${(seconds % 60).toString().padStart(2, "0")}`;
+}
+function prettyDate(value: string) { return new Date(value).toLocaleString(); }
+async function api<T>(url: string, options?: RequestInit): Promise<T> {
+  const response = await fetch(`${API}${url}`, options);
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.error || `Request failed: ${response.status}`);
+  }
+  return response.json() as Promise<T>;
+}
+
+export default function App() {
+  const [calls, setCalls] = useState<CallRecord[]>([]);
+  const [messages, setMessages] = useState<TranscriptMessage[]>([]);
+  const [duration, setDuration] = useState(0);
+  const [active, setActive] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [recordConsent, setRecordConsent] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [partial, setPartial] = useState("");
+  const [status, setStatus] = useState("Ready to start");
+  const [error, setError] = useState("");
+  const [selected, setSelected] = useState<CallRecord | null>(null);
+  const [tab, setTab] = useState<"call" | "history">("call");
+  const callId = useRef("");
+  const startedAt = useRef(0);
+  const recognition = useRef<Recognition | null>(null);
+  const activeRef = useRef(false);
+  const speaking = useRef(false);
+  const recorder = useRef<MediaRecorder | null>(null);
+  const audioChunks = useRef<Blob[]>([]);
+  const mediaStream = useRef<MediaStream | null>(null);
+  const consentRef = useRef(false);
+  const messagesRef = useRef<TranscriptMessage[]>([]);
+  const busyRef = useRef(false);
+  const stoppingRef = useRef(false);
+  const savingRef = useRef(false);
+
+  const refreshCalls = useCallback(async () => {
+    try { setCalls(await api<CallRecord[]>("/api/calls")); }
+    catch (e) { setError(e instanceof Error ? e.message : "Could not load history."); }
+  }, []);
+  useEffect(() => { void refreshCalls(); }, [refreshCalls]);
+  useEffect(() => {
+    if (!active) return;
+    const timer = window.setInterval(() => setDuration(Math.floor((Date.now() - startedAt.current) / 1000)), 1000);
+    return () => window.clearInterval(timer);
+  }, [active]);
+
+  const addMessage = useCallback((role: TranscriptMessage["role"], text: string) => {
+    const item = { role, text, time: new Date().toISOString() };
+    messagesRef.current = [...messagesRef.current, item];
+    setMessages(messagesRef.current);
+  }, []);
+
+  const speak = useCallback((text: string) => new Promise<void>(resolve => {
+    if (!("speechSynthesis" in window)) { resolve(); return; }
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = "en-US"; utterance.rate = 1;
+    utterance.onstart = () => { speaking.current = true; setStatus("AI speaking"); };
+    utterance.onend = () => { speaking.current = false; resolve(); };
+    utterance.onerror = () => { speaking.current = false; resolve(); };
+    window.speechSynthesis.speak(utterance);
+  }), []);
+
+  const handleCustomerSpeech = useCallback(async (text: string) => {
+    if (!activeRef.current || busyRef.current || !text.trim()) return;
+    busyRef.current = true; setBusy(true); setPartial(""); addMessage("customer", text.trim()); setStatus("Thinking");
+    try {
+      const history = messagesRef.current.slice(-12).map(m => ({
+        role: m.role === "customer" ? "user" : "model", text: m.text
+      }));
+      history.pop();
+      const result = await api<{ reply: string }>("/api/chat", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text.trim(), history })
+      });
+      if (!activeRef.current) return;
+      addMessage("assistant", result.reply);
+      await speak(result.reply);
+      setStatus("Listening");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "AI request failed."); setStatus("Response error");
+    } finally {
+      busyRef.current = false; setBusy(false);
+      if (activeRef.current && !speaking.current && recognition.current) {
+        try { recognition.current.start(); } catch { /* already started */ }
+      }
+    }
+  }, [addMessage, speak]);
+
+  const startCall = async () => {
+    setError(""); setMessages([]); messagesRef.current = []; audioChunks.current = [];
+    stoppingRef.current = false; savingRef.current = false; setDuration(0);
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      setError("Speech recognition is unavailable. Use a recent Chrome browser and allow microphone access."); return;
+    }
+    try {
+      if (recordConsent) {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaStream.current = stream;
+        const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
+        const mediaRecorder = new MediaRecorder(stream, { mimeType: mime });
+        recorder.current = mediaRecorder;
+        mediaRecorder.ondataavailable = event => { if (event.data.size > 0) audioChunks.current.push(event.data); };
+        mediaRecorder.start(1000); setRecording(true);
+      }
+      const created = await api<{ id: string }>("/api/calls", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ recordingConsent: recordConsent })
+      });
+      callId.current = created.id; consentRef.current = recordConsent; startedAt.current = Date.now();
+      activeRef.current = true; setActive(true); setStatus("Listening");
+      const agent = new SpeechRecognition();
+      agent.lang = "en-US"; agent.continuous = true; agent.interimResults = true;
+      agent.onresult = event => {
+        let interim = ""; const finals: string[] = [];
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const result = event.results[i];
+          const transcript = result[0]?.transcript ?? "";
+
+          if (result.isFinal) {
+            finals.push(transcript);
+          } else {
+            interim += transcript;
+          }
         }
         setPartial(interim);
         if (finals.length && activeRef.current && !busyRef.current) void handleCustomerSpeech(finals.join(" "));
