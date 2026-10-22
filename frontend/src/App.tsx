@@ -149,7 +149,8 @@ export default function App() {
       agent.onresult = event => {
         let interim = ""; const finals: string[] = [];
         for (let i = event.resultIndex; i < event.results.length; i++) {
-          const result = event.results[i] as RecognitionResult;
+         const result = event.results[0][0];
+         const transcript = result.transcript;
           if (result.isFinal) finals.push(result.transcript); else interim += result.transcript;
         }
         setPartial(interim);
